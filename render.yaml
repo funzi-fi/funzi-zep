@@ -3,7 +3,7 @@ services:
     name: zep
     autoDeploy: false
     env: image
-    region: frankfurt
+    region: germany
     image:
       url: ghcr.io/getzep/zep-cloud:latest
     healthCheckPath: /healthz
