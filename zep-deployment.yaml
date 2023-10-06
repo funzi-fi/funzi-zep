@@ -65,7 +65,6 @@ spec:
               value: "false"
           readinessProbe:
             tcpSocket:
-              host: 127.0.0.1
               port: 8080
             initialDelaySeconds: 45
             periodSeconds: 10
@@ -95,7 +94,7 @@ spec:
           ports:
             - containerPort: 8000
           env:
-            - name: ZEP_MEMORY_STORE_POSTGRES_DSN
+            - name: ZEP_STORE_POSTGRES_DSN
               value: postgres://postgres:postgres@zep-postgres:5432/postgres?sslmode=disable
             - name: ZEP_NLP_SERVER_URL
               value: http://zep-nlp:8080
@@ -120,7 +119,6 @@ spec:
               subPath: config.yaml
           readinessProbe:
             tcpSocket:
-              host: 127.0.0.1
               port: 8000
             initialDelaySeconds: 40
             periodSeconds: 5
