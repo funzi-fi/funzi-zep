@@ -11,6 +11,7 @@ import (
 	"github.com/getzep/zep/pkg/models"
 	"github.com/google/uuid"
 	"github.com/uptrace/bun"
+	"github.com/uptrace/bun/driver/pgdriver"
 )
 
 func NewDocumentCollectionDAO(
@@ -46,6 +47,15 @@ func (dc *DocumentCollectionDAO) Create(
 		dc.TableName = tableName
 	}
 
+	// Determine the index type to use. Default to HNSW if available, otherwise
+	// use IVFFLAT.
+	dc.IndexType = "ivfflat"
+	if dc.appState.Config.Store.Postgres.AvailableIndexes.HSNW {
+		dc.IndexType = "hnsw"
+		// We'll create the index when we create the document table.
+		dc.IsIndexed = true
+	}
+
 	// We only support cosine distance function for now.
 	dc.DistanceFunction = "cosine"
 
@@ -56,15 +66,15 @@ func (dc *DocumentCollectionDAO) Create(
 		Returning("*").
 		Exec(ctx)
 	if err != nil {
-		if strings.Contains(err.Error(), "duplicate key value violates unique constraint") {
-			return fmt.Errorf("collection with name %s already exists", dc.Name)
+		if err, ok := err.(pgdriver.Error); ok && err.IntegrityViolation() {
+			return models.NewBadRequestError("collection already exists: " + dc.Name)
 		}
 		return fmt.Errorf("failed to insert collection: %w", err)
 	}
 
 	// Create the document table for the collection. It will only be created if
 	// it doesn't already exist.
-	err = createDocumentTable(ctx, dc.db, dc.TableName, dc.EmbeddingDimensions)
+	err = createDocumentTable(ctx, dc.appState, dc.db, dc.TableName, dc.EmbeddingDimensions)
 	if err != nil {
 		return fmt.Errorf("failed to create document table: %w", err)
 	}
@@ -261,6 +271,9 @@ func (dc *DocumentCollectionDAO) CreateDocuments(
 		Returning("uuid").
 		Exec(ctx)
 	if err != nil {
+		if err, ok := err.(pgdriver.Error); ok && err.IntegrityViolation() {
+			return nil, models.NewBadRequestError("document_id already exists")
+		}
 		if strings.Contains(err.Error(), "different vector dimensions") {
 			return nil, store.NewEmbeddingMismatchError(err)
 		}

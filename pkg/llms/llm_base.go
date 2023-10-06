@@ -3,6 +3,8 @@ package llms
 import (
 	"context"
 	"fmt"
+	"net/http"
+	"time"
 
 	"github.com/getzep/zep/pkg/models"
 
@@ -14,7 +16,6 @@ import (
 )
 
 const DefaultTemperature = 0.0
-const MaxAPIRequestAttempts = 5
 const InvalidLLMModelError = "llm model is not set or is invalid"
 
 var log = internal.GetLogger()
@@ -49,6 +50,11 @@ func NewLLMClient(ctx context.Context, cfg *config.Config) (models.ZepLLM, error
 			}
 			return NewOpenAILLM(ctx, cfg)
 		}
+		// if custom OpenAI Endpoint is set, do not validate model name
+		if cfg.LLM.OpenAIEndpoint != "" {
+			return NewOpenAILLM(ctx, cfg)
+		}
+		// Otherwise, validate model name
 		if _, ok := ValidOpenAILLMs[cfg.LLM.Model]; !ok {
 			return nil, fmt.Errorf(
 				"invalid llm model \"%s\" for %s",
@@ -112,6 +118,10 @@ var MaxLLMTokensMap = map[string]int{
 
 func GetLLMModelName(cfg *config.Config) (string, error) {
 	llmModel := cfg.LLM.Model
+	// only validate model name if OpenAI endpoint is not set
+	if cfg.LLM.OpenAIEndpoint != "" {
+		return llmModel, nil
+	}
 	if llmModel == "" || !ValidLLMMap[llmModel] {
 		return "", NewLLMError(InvalidLLMModelError, nil)
 	}
@@ -130,12 +140,33 @@ func Float64ToFloat32Matrix(in [][]float64) [][]float32 {
 	return out
 }
 
-func NewRetryableHTTPClient() *retryablehttp.Client {
-	retryableHttpClient := retryablehttp.NewClient()
-	retryableHttpClient.RetryMax = MaxAPIRequestAttempts
-	retryableHttpClient.Logger = log
+func NewRetryableHTTPClient(retryMax int, timeout time.Duration) *retryablehttp.Client {
+	retryableHTTPClient := retryablehttp.NewClient()
+	retryableHTTPClient.RetryMax = retryMax
+	retryableHTTPClient.HTTPClient.Timeout = timeout
+	retryableHTTPClient.Logger = log
+	retryableHTTPClient.Backoff = retryablehttp.DefaultBackoff
+	retryableHTTPClient.CheckRetry = retryPolicy
 
-	return retryableHttpClient
+	return retryableHTTPClient
+}
+
+// retryPolicy is a retryablehttp.CheckRetry function. It is used to determine
+// whether a request should be retried or not.
+func retryPolicy(ctx context.Context, resp *http.Response, err error) (bool, error) {
+	// do not retry on context.Canceled or context.DeadlineExceeded
+	if ctx.Err() != nil {
+		return false, ctx.Err()
+	}
+
+	// Do not retry 400 errors as they're used by OpenAI to indicate maximum
+	// context length exceeded
+	if resp != nil && resp.StatusCode == 400 {
+		return false, err
+	}
+
+	shouldRetry, _ := retryablehttp.DefaultRetryPolicy(ctx, resp, err)
+	return shouldRetry, nil
 }
 
 // useOpenAIEmbeddings is true if OpenAI embeddings are enabled

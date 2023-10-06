@@ -3,16 +3,17 @@ package config
 // Config holds the configuration of the application
 // Use cmd.NewConfig to create a new instance
 type Config struct {
-	LLM         LLM              `mapstructure:"llm"`
-	NLP         NLP              `mapstructure:"nlp"`
-	Memory      MemoryConfig     `mapstructure:"memory"`
-	Extractors  ExtractorsConfig `mapstructure:"extractors"`
-	Store       StoreConfig      `mapstructure:"store"`
-	Server      ServerConfig     `mapstructure:"server"`
-	Log         LogConfig        `mapstructure:"log"`
-	Auth        AuthConfig       `mapstructure:"auth"`
-	DataConfig  DataConfig       `mapstructure:"data"`
-	Development bool             `mapstructure:"development"`
+	LLM           LLM                 `mapstructure:"llm"`
+	NLP           NLP                 `mapstructure:"nlp"`
+	Memory        MemoryConfig        `mapstructure:"memory"`
+	Extractors    ExtractorsConfig    `mapstructure:"extractors"`
+	Store         StoreConfig         `mapstructure:"store"`
+	Server        ServerConfig        `mapstructure:"server"`
+	Log           LogConfig           `mapstructure:"log"`
+	Auth          AuthConfig          `mapstructure:"auth"`
+	DataConfig    DataConfig          `mapstructure:"data"`
+	Development   bool                `mapstructure:"development"`
+	CustomPrompts CustomPromptsConfig `mapstructure:"custom_prompts"`
 }
 
 type StoreConfig struct {
@@ -45,7 +46,13 @@ type MemoryConfig struct {
 }
 
 type PostgresConfig struct {
-	DSN string `mapstructure:"dsn"`
+	DSN              string           `mapstructure:"dsn"`
+	AvailableIndexes AvailableIndexes `mapstructure:"available_indexes"`
+}
+
+type AvailableIndexes struct {
+	IVFFLAT bool `mapstructure:"ivfflat"`
+	HSNW    bool `mapstructure:"hsnw"`
 }
 
 type ServerConfig struct {
@@ -90,10 +97,25 @@ type SummarizerConfig struct {
 	Enabled bool `mapstructure:"enabled"`
 }
 
+type CustomPromptsConfig struct {
+	SummarizerPrompts ExtractorPromptsConfig `mapstructure:"summarizer_prompts"`
+}
+
+type ExtractorPromptsConfig struct {
+	OpenAI    string `mapstructure:"openai"`
+	Anthropic string `mapstructure:"anthropic"`
+}
+
 type EmbeddingsConfig struct {
 	Enabled    bool   `mapstructure:"enabled"`
 	Dimensions int    `mapstructure:"dimensions"`
 	Service    string `mapstructure:"service"`
+	// MaxProcs is the maximum number of concurrent processes to use for embedding tasks.
+	MaxProcs int `mapstructure:"max_procs"`
+	// ChunkSize is the number of documents to embed in a single task.
+	ChunkSize int `mapstructure:"chunk_size"`
+	// BufferSize is the size of the channel buffer for embedding tasks.
+	BufferSize int `mapstructure:"buffer_size"`
 }
 
 type EntityExtractorConfig struct {
