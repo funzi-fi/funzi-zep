@@ -83,7 +83,7 @@ type Document struct {
 	Embedding []float32 `bun:"type:vector,nullzero" json:"embedding,omitempty"`
 }
 
-type SearchDocumentQuery struct {
+type SearchDocumentResult struct {
 	*Document
 	Score float64 `json:"score" bun:"score"`
 }
@@ -127,9 +127,7 @@ type DocumentResponse struct {
 }
 
 type DocEmbeddingTask struct {
-	UUID           uuid.UUID `json:"uuid"`
-	CollectionName string    `json:"collection_name"`
-	Content        string    `json:"content"`
+	UUID uuid.UUID `json:"uuid"`
 }
 
 type DocEmbeddingUpdate struct {

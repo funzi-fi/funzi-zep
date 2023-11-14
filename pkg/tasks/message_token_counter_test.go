@@ -1,8 +1,10 @@
-package extractors
+package tasks
 
 import (
+	"encoding/json"
 	"testing"
 
+	"github.com/ThreeDotsLabs/watermill/message"
 	"github.com/getzep/zep/pkg/llms"
 
 	"github.com/getzep/zep/internal"
@@ -37,17 +39,22 @@ func runTestTokenCountExtractor(
 
 	messages := memories.Messages
 
-	messageEvent := &models.MessageEvent{
-		SessionID: sessionID,
-		Messages:  messages,
-	}
+	tokenCountExtractor := NewMessageTokenCountTask(appState)
 
-	tokenCountExtractor := NewTokenCountExtractor()
-
-	err = tokenCountExtractor.Extract(testCtx, appState, messageEvent)
+	p, err := json.Marshal(messages)
 	assert.NoError(t, err)
 
-	memory, err := appState.MemoryStore.GetMemory(testCtx, appState, messageEvent.SessionID, 0)
+	m := &message.Message{
+		Metadata: message.Metadata{
+			"session_id": sessionID,
+		},
+		Payload: p,
+	}
+
+	err = tokenCountExtractor.Execute(testCtx, m)
+	assert.NoError(t, err)
+
+	memory, err := appState.MemoryStore.GetMemory(testCtx, appState, sessionID, 0)
 	assert.NoError(t, err)
 	assert.Equal(t, len(memory.Messages), len(messages))
 
@@ -68,6 +75,8 @@ func TestTokenCountExtractor_OpenAI(t *testing.T) {
 
 	for i := range memory.Messages {
 		assert.True(t, memory.Messages[i].TokenCount > 0)
+		assert.NotEmpty(t, memory.Messages[i].Content)
+		assert.NotEmpty(t, memory.Messages[i].Role)
 	}
 }
 
@@ -82,6 +91,8 @@ func TestTokenCountExtractor_Anthropic(t *testing.T) {
 
 	for i := range memory.Messages {
 		assert.Zero(t, memory.Messages[i].TokenCount)
+		assert.NotEmpty(t, memory.Messages[i].Content)
+		assert.NotEmpty(t, memory.Messages[i].Role)
 	}
 
 	// reset config

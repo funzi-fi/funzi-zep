@@ -7,9 +7,17 @@ import (
 	"github.com/uptrace/bun"
 )
 
+const DefaultMMRMultiplier = 2
+const DefaultMMRLambda = 0.5
+
 // parseJSONQuery recursively parses a JSONQuery and returns a bun.QueryBuilder.
 // TODO: fix the addition of extraneous parentheses in the query
-func parseJSONQuery(qb bun.QueryBuilder, jq *JSONQuery, isOr bool, tablePrefix string) bun.QueryBuilder {
+func parseJSONQuery(
+	qb bun.QueryBuilder,
+	jq *JSONQuery,
+	isOr bool,
+	tablePrefix string,
+) bun.QueryBuilder {
 	var tp string
 	if tablePrefix != "" {
 		tp = tablePrefix + "."
@@ -23,7 +31,7 @@ func parseJSONQuery(qb bun.QueryBuilder, jq *JSONQuery, isOr bool, tablePrefix s
 			)
 		} else {
 			qb = qb.Where(
-				"jsonb_path_exists(m.metadata, ?)",
+				fmt.Sprintf("jsonb_path_exists(%smetadata, ?)", tp),
 				path,
 			)
 		}

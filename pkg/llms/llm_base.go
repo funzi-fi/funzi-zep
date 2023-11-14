@@ -4,9 +4,17 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"net/http/httptrace"
 	"time"
 
+	"go.opentelemetry.io/contrib/instrumentation/net/http/httptrace/otelhttptrace"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+
+	"go.opentelemetry.io/otel"
+
 	"github.com/getzep/zep/pkg/models"
+	"github.com/tmc/langchaingo/llms"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/hashicorp/go-retryablehttp"
 
@@ -17,6 +25,7 @@ import (
 
 const DefaultTemperature = 0.0
 const InvalidLLMModelError = "llm model is not set or is invalid"
+const OtelLLMTracerName = "llm"
 
 var log = internal.GetLogger()
 
@@ -80,6 +89,56 @@ func NewLLMClient(ctx context.Context, cfg *config.Config) (models.ZepLLM, error
 	}
 }
 
+var _ models.ZepLLM = &ZepLLM{}
+
+// ZepLLM is a wrapper around the Zep LLM implementations that implements the
+// ZepLLM interface and adds OpenTelemetry tracing
+type ZepLLM struct {
+	llm    models.ZepLLM
+	tracer trace.Tracer
+}
+
+func (zllm *ZepLLM) Call(ctx context.Context,
+	prompt string,
+	options ...llms.CallOption,
+) (string, error) {
+	ctx, span := zllm.tracer.Start(ctx, "llm.Call")
+	defer span.End()
+
+	result, err := zllm.llm.Call(ctx, prompt, options...)
+	if err != nil {
+		span.RecordError(err)
+		return "", err
+	}
+
+	return result, err
+}
+
+func (zllm *ZepLLM) EmbedTexts(ctx context.Context, texts []string) ([][]float32, error) {
+	ctx, span := zllm.tracer.Start(ctx, "llm.EmbedTexts")
+	defer span.End()
+
+	result, err := zllm.llm.EmbedTexts(ctx, texts)
+	if err != nil {
+		span.RecordError(err)
+		return nil, err
+	}
+
+	return result, err
+}
+
+func (zllm *ZepLLM) GetTokenCount(text string) (int, error) {
+	return zllm.llm.GetTokenCount(text)
+}
+
+func (zllm *ZepLLM) Init(ctx context.Context, cfg *config.Config) error {
+	// set up tracing
+	tracer := otel.Tracer(OtelLLMTracerName)
+	zllm.tracer = tracer
+
+	return zllm.llm.Init(ctx, cfg)
+}
+
 type LLMError struct {
 	message       string
 	originalError error
@@ -94,10 +153,12 @@ func NewLLMError(message string, originalError error) *LLMError {
 }
 
 var ValidOpenAILLMs = map[string]bool{
-	"gpt-3.5-turbo":     true,
-	"gpt-4":             true,
-	"gpt-3.5-turbo-16k": true,
-	"gpt-4-32k":         true,
+	"gpt-3.5-turbo":      true,
+	"gpt-4":              true,
+	"gpt-3.5-turbo-16k":  true,
+	"gpt-3.5-turbo-1106": true,
+	"gpt-4-32k":          true,
+	"gpt-4-1106-preview": true,
 }
 
 var ValidAnthropicLLMs = map[string]bool{
@@ -108,18 +169,20 @@ var ValidAnthropicLLMs = map[string]bool{
 var ValidLLMMap = internal.MergeMaps(ValidOpenAILLMs, ValidAnthropicLLMs)
 
 var MaxLLMTokensMap = map[string]int{
-	"gpt-3.5-turbo":     4096,
-	"gpt-3.5-turbo-16k": 16_384,
-	"gpt-4":             8192,
-	"gpt-4-32k":         32_768,
-	"claude-instant-1":  100_000,
-	"claude-2":          100_000,
+	"gpt-3.5-turbo":      4096,
+	"gpt-3.5-turbo-16k":  16_385,
+	"gpt-3.5-turbo-1106": 16_385,
+	"gpt-4":              8192,
+	"gpt-4-32k":          32_768,
+	"gpt-4-1106-preview": 128_000,
+	"claude-instant-1":   100_000,
+	"claude-2":           100_000,
 }
 
 func GetLLMModelName(cfg *config.Config) (string, error) {
 	llmModel := cfg.LLM.Model
-	// only validate model name if OpenAI endpoint is not set
-	if cfg.LLM.OpenAIEndpoint != "" {
+	// Don't validate if custom OpenAI endpoint or Azure OpenAI endpoint is set
+	if cfg.LLM.OpenAIEndpoint != "" || cfg.LLM.AzureOpenAIEndpoint != "" {
 		return llmModel, nil
 	}
 	if llmModel == "" || !ValidLLMMap[llmModel] {
@@ -140,7 +203,7 @@ func Float64ToFloat32Matrix(in [][]float64) [][]float32 {
 	return out
 }
 
-func NewRetryableHTTPClient(retryMax int, timeout time.Duration) *retryablehttp.Client {
+func NewRetryableHTTPClient(retryMax int, timeout time.Duration) *http.Client {
 	retryableHTTPClient := retryablehttp.NewClient()
 	retryableHTTPClient.RetryMax = retryMax
 	retryableHTTPClient.HTTPClient.Timeout = timeout
@@ -148,7 +211,16 @@ func NewRetryableHTTPClient(retryMax int, timeout time.Duration) *retryablehttp.
 	retryableHTTPClient.Backoff = retryablehttp.DefaultBackoff
 	retryableHTTPClient.CheckRetry = retryPolicy
 
-	return retryableHTTPClient
+	httpClient := &http.Client{
+		Transport: otelhttp.NewTransport(
+			retryableHTTPClient.StandardClient().Transport,
+			otelhttp.WithClientTrace(func(ctx context.Context) *httptrace.ClientTrace {
+				return otelhttptrace.NewClientTrace(ctx)
+			}),
+		),
+	}
+
+	return httpClient
 }
 
 // retryPolicy is a retryablehttp.CheckRetry function. It is used to determine

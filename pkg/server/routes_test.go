@@ -10,6 +10,7 @@ import (
 	"github.com/getzep/zep/internal"
 	"github.com/getzep/zep/pkg/llms"
 	"github.com/getzep/zep/pkg/store/postgres"
+	"github.com/getzep/zep/pkg/tasks"
 	"github.com/getzep/zep/pkg/testutils"
 	"github.com/sirupsen/logrus"
 	"github.com/uptrace/bun"
@@ -66,6 +67,23 @@ func setup() {
 
 	testUserStore = postgres.NewUserStoreDAO(testDB)
 	appState.UserStore = testUserStore
+
+	documentStore, err := postgres.NewDocumentStore(
+		testCtx,
+		appState,
+		testDB,
+	)
+	if err != nil {
+		log.Fatalf("unable to create documentStore: %v", err)
+	}
+	appState.DocumentStore = documentStore
+
+	// Set up the task router
+	db, err := postgres.NewPostgresConnForQueue(appState)
+	if err != nil {
+		panic(err)
+	}
+	tasks.RunTaskRouter(testCtx, appState, db)
 
 	testServer = httptest.NewServer(
 		setupRouter(appState),

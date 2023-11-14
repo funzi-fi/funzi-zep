@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/getzep/zep/pkg/store/postgres"
+	"github.com/getzep/zep/pkg/tasks"
 
 	"github.com/getzep/zep/pkg/auth"
 
@@ -18,16 +19,22 @@ import (
 	"github.com/uptrace/bun"
 
 	"github.com/getzep/zep/config"
-	"github.com/getzep/zep/pkg/extractors"
 	"github.com/getzep/zep/pkg/llms"
 	"github.com/getzep/zep/pkg/models"
 	"github.com/getzep/zep/pkg/server"
+
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
+	"go.opentelemetry.io/otel/sdk/resource"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 )
 
 const (
-	ErrStoreTypeNotSet   = "store.type must be set"
-	ErrPostgresDSNNotSet = "store.postgres.dsn must be set"
-	StoreTypePostgres    = "postgres"
+	ErrStoreTypeNotSet             = "store.type must be set"
+	ErrPostgresDSNNotSet           = "store.postgres.dsn must be set"
+	ErrOtelEnabledButExporterEmpty = "OpenTelemtry is enabled but OTEL_EXPORTER_OTLP_ENDPOINT is not set"
+	StoreTypePostgres              = "postgres"
 )
 
 // run is the entrypoint for the zep server
@@ -44,6 +51,16 @@ func run() {
 	config.SetLogLevel(cfg)
 	appState := NewAppState(cfg)
 
+	if cfg.OpenTelemetry.Enabled {
+		cleanup := initTracer()
+		defer func() {
+			err := cleanup(context.Background())
+			if err != nil {
+				log.Errorf("Failed to cleanup tracer: %v", err)
+			}
+		}()
+	}
+
 	srv := server.Create(appState)
 
 	log.Infof("Listening on: %s", srv.Addr)
@@ -52,7 +69,7 @@ func run() {
 	}
 	err = srv.ListenAndServe()
 	if err != nil {
-		log.Fatal(err)
+		log.Panic(err)
 	}
 }
 
@@ -72,12 +89,11 @@ func NewAppState(cfg *config.Config) *models.AppState {
 		Config:    cfg,
 	}
 
-	initializeStores(appState)
+	initializeStores(ctx, appState)
 
-	// Init the extractors, which will register themselves with the MemoryStore
-	extractors.Initialize(appState)
+	setupTaskRouter(ctx, appState)
 
-	setupSignalHandler(appState)
+	setupSignalHandler(ctx, appState)
 
 	setupPurgeProcessor(ctx, appState)
 
@@ -100,7 +116,7 @@ func handleCLIOptions(cfg *config.Config) {
 }
 
 // initializeStores initializes the memory and document stores based on the config file / ENV
-func initializeStores(appState *models.AppState) {
+func initializeStores(ctx context.Context, appState *models.AppState) {
 	if appState.Config.Store.Type == "" {
 		log.Fatal(ErrStoreTypeNotSet)
 	}
@@ -123,36 +139,15 @@ func initializeStores(appState *models.AppState) {
 		}
 		log.Debug("memoryStore created")
 
-		// create channels for the document embedding processor
-		embeddingTaskChannel := make(
-			chan []models.DocEmbeddingTask,
-			// We use the Pool's buffer, so this doesn't need to be large
-			10,
-		)
-		// TODO: Make channel size configurable
-		embeddingUpdateChannel := make(chan []models.DocEmbeddingUpdate, 500)
 		documentStore, err := postgres.NewDocumentStore(
+			ctx,
 			appState,
 			db,
-			embeddingUpdateChannel,
-			embeddingTaskChannel,
 		)
 		if err != nil {
 			log.Fatalf("unable to create documentStore: %v", err)
 		}
 		log.Debug("documentStore created")
-
-		// start the document embedding processor
-		embeddingProcessor := extractors.NewDocEmbeddingProcessor(
-			appState,
-			embeddingTaskChannel,
-			embeddingUpdateChannel,
-		)
-		err = embeddingProcessor.Run(context.Background())
-		if err != nil {
-			log.Fatalf("unable to start embeddingProcessor: %v", err)
-		}
-		log.Debug("embeddingProcessor started")
 
 		userStore := postgres.NewUserStoreDAO(db)
 		log.Debug("userStore created")
@@ -185,7 +180,7 @@ func pgDebugLogging(db *bun.DB) {
 }
 
 // setupSignalHandler sets up a signal handler to close the store connections and channels on termination
-func setupSignalHandler(appState *models.AppState) {
+func setupSignalHandler(ctx context.Context, appState *models.AppState) {
 	signalCh := make(chan os.Signal, 1)
 	signal.Notify(signalCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
@@ -193,11 +188,23 @@ func setupSignalHandler(appState *models.AppState) {
 		if err := appState.MemoryStore.Close(); err != nil {
 			log.Errorf("Error closing MemoryStore connection: %v", err)
 		}
-		if err := appState.DocumentStore.Shutdown(context.Background()); err != nil {
+		if err := appState.DocumentStore.Shutdown(ctx); err != nil {
 			log.Errorf("Error shutting down DocumentStore: %v", err)
+		}
+		if err := appState.TaskRouter.Close(); err != nil {
+			log.Errorf("Error closing LLMClient connection: %v", err)
 		}
 		os.Exit(0)
 	}()
+}
+
+// setupTaskRouter runs the Watermill task router
+func setupTaskRouter(ctx context.Context, appState *models.AppState) {
+	db, err := postgres.NewPostgresConnForQueue(appState)
+	if err != nil {
+		log.Fatalf("failed to create postgres queue connection %v", err)
+	}
+	tasks.RunTaskRouter(ctx, appState, db)
 }
 
 // setupPurgeProcessor sets up a go routine to purge deleted records from the MemoryStore
@@ -235,4 +242,37 @@ func dumpConfigToJSON(cfg *config.Config) string {
 	}
 
 	return string(b)
+}
+
+func initTracer() func(context.Context) error {
+	if os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT") == "" {
+		log.Fatal(ErrOtelEnabledButExporterEmpty)
+	}
+	exporter, err := otlptrace.New(
+		context.Background(),
+		otlptracehttp.NewClient(),
+	)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	resources, err := resource.New(context.Background(),
+		resource.WithFromEnv(),
+		resource.WithProcess(),
+		resource.WithOS(),
+		resource.WithContainer(),
+		resource.WithHost(),
+	)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	otel.SetTracerProvider(
+		sdktrace.NewTracerProvider(
+			sdktrace.WithSampler(sdktrace.AlwaysSample()),
+			sdktrace.WithBatcher(exporter),
+			sdktrace.WithResource(resources),
+		),
+	)
+	return exporter.Shutdown
 }

@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/getzep/zep/pkg/web"
+	"github.com/riandyrn/otelchi"
 
 	"github.com/getzep/zep/internal"
 
@@ -22,6 +23,8 @@ import (
 )
 
 const ReadHeaderTimeout = 5 * time.Second
+const OtelTracerNamer = "chi-server"
+const RouterName = "router"
 
 var log = internal.GetLogger()
 
@@ -48,14 +51,27 @@ func Create(appState *models.AppState) *http.Server {
 // @name						Authorization
 // @description				Type "Bearer" followed by a space and JWT token.
 func setupRouter(appState *models.AppState) *chi.Mux {
+	maxRequestSize := appState.Config.Server.MaxRequestSize
+	if maxRequestSize == 0 {
+		maxRequestSize = 5 << 20 // 5MB
+	}
+
 	router := chi.NewRouter()
-	router.Use(httpLogger.Logger("router", log))
-	router.Use(middleware.Recoverer)
-	router.Use(middleware.RequestID)
-	router.Use(middleware.RealIP)
-	router.Use(middleware.CleanPath)
-	router.Use(SendVersion)
-	router.Use(middleware.Heartbeat("/healthz"))
+	router.Use(
+		httpLogger.Logger(RouterName, log),
+		otelchi.Middleware(
+			RouterName,
+			otelchi.WithChiRoutes(router),
+			otelchi.WithRequestMethodInSpanName(true),
+		),
+		middleware.RequestSize(maxRequestSize),
+		middleware.Recoverer,
+		middleware.RequestID,
+		middleware.RealIP,
+		middleware.CleanPath,
+		SendVersion,
+		middleware.Heartbeat("/healthz"),
+	)
 
 	// Only setup web routes if enabled
 	if appState.Config.Server.WebEnabled {

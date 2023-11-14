@@ -3,16 +3,21 @@ package postgres
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"runtime"
 	"strings"
 	"time"
 
+	"github.com/uptrace/bun/extra/bunotel"
+
+	"github.com/getzep/zep/pkg/store/postgres/migrations"
+
 	"github.com/Masterminds/semver/v3"
+	_ "github.com/jackc/pgx/v5/stdlib" // required for pgx to work
 	"github.com/uptrace/bun/driver/pgdriver"
 
 	"github.com/getzep/zep/pkg/llms"
-	"github.com/getzep/zep/pkg/store/postgres/migrations"
 	"github.com/uptrace/bun/dialect/pgdialect"
 
 	"github.com/getzep/zep/pkg/models"
@@ -21,6 +26,10 @@ import (
 	"github.com/pgvector/pgvector-go"
 	"github.com/uptrace/bun"
 )
+
+const defaultEmbeddingDims = 1536
+
+var maxOpenConns = 4 * runtime.GOMAXPROCS(0)
 
 type SessionSchema struct {
 	bun.BaseModel `bun:"table:session,alias:s" yaml:"-"`
@@ -43,14 +52,6 @@ func (s *SessionSchema) BeforeAppendModel(_ context.Context, query bun.Query) er
 	if _, ok := query.(*bun.UpdateQuery); ok {
 		s.UpdatedAt = time.Now()
 	}
-	return nil
-}
-
-// BeforeCreateTable is a marker method to ensure uniform interface across all table models - used in table creation iterator
-func (s *SessionSchema) BeforeCreateTable(
-	_ context.Context,
-	_ *bun.CreateTableQuery,
-) error {
 	return nil
 }
 
@@ -80,13 +81,6 @@ func (s *MessageStoreSchema) BeforeAppendModel(_ context.Context, query bun.Quer
 	return nil
 }
 
-func (s *MessageStoreSchema) BeforeCreateTable(
-	_ context.Context,
-	_ *bun.CreateTableQuery,
-) error {
-	return nil
-}
-
 // MessageVectorStoreSchema stores the embeddings for a message.
 type MessageVectorStoreSchema struct {
 	bun.BaseModel `bun:"table:message_embedding,alias:me"`
@@ -109,13 +103,6 @@ func (s *MessageVectorStoreSchema) BeforeAppendModel(_ context.Context, query bu
 	if _, ok := query.(*bun.UpdateQuery); ok {
 		s.UpdatedAt = time.Now()
 	}
-	return nil
-}
-
-func (s *MessageVectorStoreSchema) BeforeCreateTable(
-	_ context.Context,
-	_ *bun.CreateTableQuery,
-) error {
 	return nil
 }
 
@@ -144,10 +131,27 @@ func (s *SummaryStoreSchema) BeforeAppendModel(_ context.Context, query bun.Quer
 	return nil
 }
 
-func (s *SummaryStoreSchema) BeforeCreateTable(
-	_ context.Context,
-	_ *bun.CreateTableQuery,
-) error {
+type SummaryVectorStoreSchema struct {
+	bun.BaseModel `bun:"table:summary_embedding,alias:se" yaml:"-"`
+
+	UUID        uuid.UUID           `bun:",pk,type:uuid,default:gen_random_uuid()"`
+	CreatedAt   time.Time           `bun:"type:timestamptz,notnull,default:current_timestamp"`
+	UpdatedAt   time.Time           `bun:"type:timestamptz,nullzero,default:current_timestamp"`
+	DeletedAt   time.Time           `bun:"type:timestamptz,soft_delete,nullzero"`
+	SessionID   string              `bun:",notnull"`
+	SummaryUUID uuid.UUID           `bun:"type:uuid,notnull,unique"`
+	Embedding   pgvector.Vector     `bun:"type:vector(1536)"`
+	IsEmbedded  bool                `bun:"type:bool,notnull,default:false"`
+	Summary     *SummaryStoreSchema `bun:"rel:belongs-to,join:summary_uuid=uuid,on_delete:cascade"`
+	Session     *SessionSchema      `bun:"rel:belongs-to,join:session_id=session_id,on_delete:cascade"`
+}
+
+var _ bun.BeforeAppendModelHook = (*SummaryVectorStoreSchema)(nil)
+
+func (s *SummaryVectorStoreSchema) BeforeAppendModel(_ context.Context, query bun.Query) error {
+	if _, ok := query.(*bun.UpdateQuery); ok {
+		s.UpdatedAt = time.Now()
+	}
 	return nil
 }
 
@@ -155,13 +159,6 @@ func (s *SummaryStoreSchema) BeforeCreateTable(
 type DocumentCollectionSchema struct {
 	bun.BaseModel             `bun:"table:document_collection,alias:dc" yaml:"-"`
 	models.DocumentCollection `                                         yaml:",inline"`
-}
-
-func (s *DocumentCollectionSchema) BeforeCreateTable(
-	_ context.Context,
-	_ *bun.CreateTableQuery,
-) error {
-	return nil
 }
 
 var _ bun.BeforeAppendModelHook = (*DocumentCollectionSchema)(nil)
@@ -174,7 +171,7 @@ func (s *DocumentCollectionSchema) BeforeAppendModel(_ context.Context, query bu
 }
 
 // DocumentSchemaTemplate represents the schema template for Document tables.
-// MessageEmbedding is manually added when createDocumentTable is run in order to set the correct dimensions.
+// TextData is manually added when createDocumentTable is run in order to set the correct dimensions.
 // This means the embedding is not returned when querying using bun.
 type DocumentSchemaTemplate struct {
 	bun.BaseModel `bun:"table:document,alias:d"`
@@ -205,19 +202,12 @@ func (u *UserSchema) BeforeAppendModel(_ context.Context, query bun.Query) error
 	return nil
 }
 
-// BeforeCreateTable is a marker method to ensure uniform interface across all table models - used in table creation iterator
-func (u *UserSchema) BeforeCreateTable(
-	_ context.Context,
-	_ *bun.CreateTableQuery,
-) error {
-	return nil
-}
-
 // Create session_id indexes after table creation
 var _ bun.AfterCreateTableHook = (*SessionSchema)(nil)
 var _ bun.AfterCreateTableHook = (*MessageStoreSchema)(nil)
 var _ bun.AfterCreateTableHook = (*MessageVectorStoreSchema)(nil)
 var _ bun.AfterCreateTableHook = (*SummaryStoreSchema)(nil)
+var _ bun.AfterCreateTableHook = (*SummaryVectorStoreSchema)(nil)
 var _ bun.AfterCreateTableHook = (*UserSchema)(nil)
 
 // Create Collection Name index after table creation
@@ -298,6 +288,20 @@ func (*SummaryStoreSchema) AfterCreateTable(
 	return err
 }
 
+func (*SummaryVectorStoreSchema) AfterCreateTable(
+	ctx context.Context,
+	query *bun.CreateTableQuery,
+) error {
+	_, err := query.DB().NewCreateIndex().
+		Model((*SummaryVectorStoreSchema)(nil)).
+		Index("sumvecstore_session_id_idx").
+		IfNotExists().
+		Column("session_id").
+		IfNotExists().
+		Exec(ctx)
+	return err
+}
+
 func (*DocumentCollectionSchema) AfterCreateTable(
 	ctx context.Context,
 	query *bun.CreateTableQuery,
@@ -339,8 +343,9 @@ func (*UserSchema) AfterCreateTable(
 	return nil
 }
 
-var messageTableList = []bun.BeforeCreateTableHook{
+var messageTableList = []bun.AfterCreateTableHook{
 	&MessageVectorStoreSchema{},
+	&SummaryVectorStoreSchema{},
 	&SummaryStoreSchema{},
 	&MessageStoreSchema{},
 	&SessionSchema{},
@@ -392,7 +397,7 @@ func createDocumentTable(
 }
 
 // enablePgVectorExtension creates the pgvector extension if it does not exist and updates it if it is out of date.
-func enablePgVectorExtension(ctx context.Context, db *bun.DB) error {
+func enablePgVectorExtension(_ context.Context, db *bun.DB) error {
 	// Create pgvector extension if it does not exist
 	_, err := db.Exec("CREATE EXTENSION IF NOT EXISTS vector")
 	if err != nil {
@@ -401,9 +406,15 @@ func enablePgVectorExtension(ctx context.Context, db *bun.DB) error {
 
 	// if this is an upgrade, we may need to update the pgvector extension
 	// this is a no-op if the extension is already up to date
+	// if this fails, Zep may not have rights to update extensions.
+	// this is not an issue if running on a managed service.
 	_, err = db.Exec("ALTER EXTENSION vector UPDATE")
 	if err != nil {
-		return fmt.Errorf("error updating pgvector extension: %w", err)
+		log.Errorf(
+			"error updating pgvector extension: %s. this may happen if running on a managed service without rights to update extensions.",
+			err,
+		)
+		return nil
 	}
 
 	return nil
@@ -438,23 +449,29 @@ func CreateSchema(
 		}
 	}
 
-	// check that the message embedding dimensions match the configured model
-	if err := checkMessageEmbeddingDims(ctx, appState, db); err != nil {
-		return fmt.Errorf("error checking message embedding dimensions: %w", err)
-	}
-
-	// Create HNSW index on messages_embeddings if available
-	t := "message_embedding"
-	c := "embedding"
-	if appState.Config.Store.Postgres.AvailableIndexes.HSNW {
-		if err := createHNSWIndex(ctx, db, t, c); err != nil {
-			return fmt.Errorf("error creating hnsw index: %w", err)
-		}
-	}
-
 	// apply migrations
 	if err := migrations.Migrate(ctx, db); err != nil {
 		return fmt.Errorf("failed to apply migrations: %w", err)
+	}
+
+	// check that the message and summary embedding dimensions match the configured model
+	if err := checkEmbeddingDims(ctx, appState, db, "message", "message_embedding"); err != nil {
+		return fmt.Errorf("error checking message embedding dimensions: %w", err)
+	}
+	if err := checkEmbeddingDims(ctx, appState, db, "summary", "summary_embedding"); err != nil {
+		return fmt.Errorf("error checking summary embedding dimensions: %w", err)
+	}
+
+	// Create HNSW index on message and summary embeddings if available
+	if appState.Config.Store.Postgres.AvailableIndexes.HSNW {
+		c := "embedding"
+		if err := createHNSWIndex(ctx, db, "message_embedding", c); err != nil {
+			return fmt.Errorf("error creating hnsw index: %w", err)
+		}
+
+		if err := createHNSWIndex(ctx, db, "summary_embedding", c); err != nil {
+			return fmt.Errorf("error creating hnsw index: %w", err)
+		}
 	}
 
 	return nil
@@ -493,26 +510,34 @@ func createHNSWIndex(ctx context.Context, db *bun.DB, table, column string) erro
 // checkMessageEmbeddingDims checks the dimensions of the message embedding column against the
 // dimensions of the configured message embedding model. If they do not match, the column is dropped and
 // recreated with the correct dimensions.
-func checkMessageEmbeddingDims(ctx context.Context, appState *models.AppState, db *bun.DB) error {
-	model, err := llms.GetEmbeddingModel(appState, "message")
+func checkEmbeddingDims(
+	ctx context.Context,
+	appState *models.AppState,
+	db *bun.DB,
+	documentType string,
+	tableName string,
+) error {
+	model, err := llms.GetEmbeddingModel(appState, documentType)
 	if err != nil {
-		return fmt.Errorf("error getting message embedding model: %w", err)
+		return fmt.Errorf("error getting %s embedding model: %w", documentType, err)
 	}
-	width, err := getEmbeddingColumnWidth(ctx, "message_embedding", db)
+	width, err := getEmbeddingColumnWidth(ctx, tableName, db)
 	if err != nil {
 		return fmt.Errorf("error getting embedding column width: %w", err)
 	}
 
 	if width != model.Dimensions {
 		log.Warnf(
-			"message embedding dimensions are %d, expected %d.\n migrating message embedding column width to %d. this may result in loss of existing embedding vectors",
+			"%s embedding dimensions are %d, expected %d.\n migrating %s embedding column width to %d. this may result in loss of existing embedding vectors",
+			documentType,
 			width,
 			model.Dimensions,
+			documentType,
 			model.Dimensions,
 		)
-		err := MigrateMessageEmbeddingDims(ctx, db, model.Dimensions)
+		err := MigrateEmbeddingDims(ctx, db, tableName, model.Dimensions)
 		if err != nil {
-			return fmt.Errorf("error migrating message embedding dimensions: %w", err)
+			return fmt.Errorf("error migrating %s embedding dimensions: %w", documentType, err)
 		}
 	}
 	return nil
@@ -528,40 +553,89 @@ func getEmbeddingColumnWidth(ctx context.Context, tableName string, db *bun.DB) 
 		Where("attname = 'embedding'").
 		Scan(ctx, &width)
 	if err != nil {
-		return 0, fmt.Errorf("error getting embedding column width: %w", err)
+		// Something strange has happened. Debug the schema.
+		schema, dumpErr := dumpTableSchema(ctx, db, tableName)
+		if dumpErr != nil {
+			return 0, fmt.Errorf(
+				"error getting embedding column width for %s: %w. Original error: %w",
+				tableName,
+				dumpErr,
+				err,
+			)
+		}
+		return 0, fmt.Errorf(
+			"error getting embedding column width for %s. Schema: %s: %w",
+			tableName,
+			schema,
+			err,
+		)
 	}
 	return width, nil
 }
 
-// MigrateMessageEmbeddingDims drops the old embedding column and creates a new one with the
+// dumpTableSchema enables debugging of schema issues
+func dumpTableSchema(ctx context.Context, db *bun.DB, tableName string) (string, error) {
+	type ColumnInfo struct {
+		bun.BaseModel `bun:"table:information_schema.columns" yaml:"-"`
+		ColumnName    string         `bun:"column_name"`
+		DataType      string         `bun:"data_type"`
+		CharMaxLength sql.NullInt32  `bun:"character_maximum_length"`
+		ColumnDefault sql.NullString `bun:"column_default"`
+		IsNullable    string         `bun:"is_nullable"`
+	}
+
+	var columns []ColumnInfo
+	err := db.NewSelect().
+		Model(&columns).
+		Where("table_name = ?", tableName).
+		Order("ordinal_position").
+		Scan(ctx)
+	if err != nil {
+		return "", fmt.Errorf("error getting table schema for %s: %w", tableName, err)
+	}
+
+	tableSchema := fmt.Sprintf("%+v", columns)
+
+	return tableSchema, nil
+}
+
+// MigrateEmbeddingDims drops the old embedding column and creates a new one with the
 // correct dimensions.
-func MigrateMessageEmbeddingDims(
+func MigrateEmbeddingDims(
 	ctx context.Context,
 	db *bun.DB,
+	tableName string,
 	dimensions int,
 ) error {
-	columnQuery := `DO $$ 
-BEGIN 
-    IF EXISTS (
-        SELECT 1 
-        FROM   information_schema.columns 
-        WHERE  table_name = 'message_embedding' 
-        AND    column_name = 'embedding'
-    ) THEN 
-        ALTER TABLE message_embedding DROP COLUMN embedding; 
-    END IF; 
-END $$;`
-
-	_, err := db.ExecContext(ctx, columnQuery)
-	if err != nil {
-		return fmt.Errorf("error dropping column embedding: %w", err)
+	// we may be missing a config key, so use the default dimensions if none are provided
+	if dimensions == 0 {
+		dimensions = defaultEmbeddingDims
 	}
-	_, err = db.NewAddColumn().
-		Model((*MessageVectorStoreSchema)(nil)).
-		ColumnExpr(fmt.Sprintf("embedding vector(%d)", dimensions)).
-		Exec(ctx)
+
+	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("error adding column MessageEmbedding: %w", err)
+		return fmt.Errorf("MigrateEmbeddingDims error starting transaction: %w", err)
+	}
+	defer rollbackOnError(tx)
+
+	// bun doesn't appear to support IF EXISTS for dropping columns
+	columnQuery := `ALTER TABLE ? DROP COLUMN IF EXISTS embedding;
+	ALTER TABLE ? ADD COLUMN embedding vector(?);
+`
+	_, err = tx.ExecContext(
+		ctx,
+		columnQuery,
+		bun.Ident(tableName),
+		bun.Ident(tableName),
+		dimensions,
+	)
+	if err != nil {
+		return fmt.Errorf("MigrateEmbeddingDims error dropping column embedding: %w", err)
+	}
+
+	err = tx.Commit()
+	if err != nil {
+		return fmt.Errorf("MigrateEmbeddingDims error committing transaction: %w", err)
 	}
 
 	return nil
@@ -572,8 +646,6 @@ END $$;`
 func NewPostgresConn(appState *models.AppState) (*bun.DB, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-
-	maxOpenConns := 4 * runtime.GOMAXPROCS(0)
 
 	// WithReadTimeout is 10 minutes to avoid timeouts when creating indexes.
 	// TODO: This is not ideal. Use separate connections for index creation?
@@ -587,12 +659,12 @@ func NewPostgresConn(appState *models.AppState) (*bun.DB, error) {
 	sqldb.SetMaxIdleConns(maxOpenConns)
 
 	db := bun.NewDB(sqldb, pgdialect.New())
+	db.AddQueryHook(bunotel.NewQueryHook(bunotel.WithDBName("zep")))
 
 	// Enable pgvector extension
 	err := enablePgVectorExtension(ctx, db)
 	if err != nil {
-		log.Print("error enabling pgvector extension: ", err)
-		return nil, err
+		log.Errorf("error enabling pgvector extension: %s", err)
 	}
 
 	// IVFFLAT indexes are always available
@@ -601,11 +673,22 @@ func NewPostgresConn(appState *models.AppState) (*bun.DB, error) {
 	// Check if HNSW indexes are available
 	isHNSW, err := isHNSWAvailable(ctx, db)
 	if err != nil {
-		log.Print("error checking if hnsw indexes are available: ", err)
+		log.Infof("error checking if hnsw indexes are available: %s", err)
 		return nil, err
 	}
 	if isHNSW {
 		appState.Config.Store.Postgres.AvailableIndexes.HSNW = true
+	}
+
+	return db, nil
+}
+
+// NewPostgresConnForQueue creates a new pgx connection to a postgres database using the provided DSN.
+// This connection is intended to be used for queueing tasks.
+func NewPostgresConnForQueue(appState *models.AppState) (*sql.DB, error) {
+	db, err := sql.Open("pgx", appState.Config.Store.Postgres.DSN)
+	if err != nil {
+		return nil, err
 	}
 
 	return db, nil
@@ -626,7 +709,7 @@ func isHNSWAvailable(ctx context.Context, db *bun.DB) (bool, error) {
 		Where("extname = 'vector'").
 		Scan(ctx, &version)
 	if err != nil {
-		if err == sql.ErrNoRows {
+		if errors.Is(err, sql.ErrNoRows) {
 			// The vector extension is not installed
 			log.Debug("vector extension not installed")
 			return false, nil

@@ -1,10 +1,8 @@
-package extractors
+package tasks
 
 import (
 	"math"
 	"testing"
-
-	"github.com/getzep/zep/pkg/store/postgres"
 
 	"github.com/getzep/zep/pkg/llms"
 	"github.com/getzep/zep/pkg/models"
@@ -16,9 +14,6 @@ func TestEmbeddingExtractor_Extract_OpenAI(t *testing.T) {
 	llmClient, err := llms.NewOpenAILLM(testCtx, appState.Config)
 	assert.NoError(t, err)
 	appState.LLMClient = llmClient
-
-	err = postgres.MigrateMessageEmbeddingDims(testCtx, testDB, 1536)
-	assert.NoError(t, err)
 
 	store := appState.MemoryStore
 
@@ -39,17 +34,12 @@ func TestEmbeddingExtractor_Extract_OpenAI(t *testing.T) {
 	)
 	assert.NoError(t, err)
 
-	// Get messages that are missing embeddings using appState.MemoryStore.GetMessageVectors
+	// Get messages that are missing embeddings using appState.MemoryStore.GetMessageEmbeddings
 	memories, err := store.GetMemory(testCtx, appState, sessionID, 0)
 	assert.NoError(t, err)
 	assert.True(t, len(memories.Messages) == len(testMessages))
 
 	unembeddedMessages := memories.Messages
-	// Create messageEvent. We only need to pass the sessionID
-	messageEvent := &models.MessageEvent{
-		SessionID: sessionID,
-		Messages:  unembeddedMessages,
-	}
 
 	texts := make([]string, len(unembeddedMessages))
 	for i, r := range unembeddedMessages {
@@ -63,34 +53,34 @@ func TestEmbeddingExtractor_Extract_OpenAI(t *testing.T) {
 	embeddings, err := llms.EmbedTexts(testCtx, appState, model, documentType, texts)
 	assert.NoError(t, err)
 
-	expectedEmbeddingRecords := make([]models.MessageEmbedding, len(unembeddedMessages))
+	expectedEmbeddingRecords := make([]models.TextData, len(unembeddedMessages))
 	for i, r := range unembeddedMessages {
-		expectedEmbeddingRecords[i] = models.MessageEmbedding{
+		expectedEmbeddingRecords[i] = models.TextData{
 			TextUUID:  r.UUID,
 			Text:      r.Content,
 			Embedding: embeddings[i],
 		}
 	}
 
-	embeddingExtractor := NewEmbeddingExtractor()
-	err = embeddingExtractor.Extract(testCtx, appState, messageEvent)
+	task := NewMessageEmbedderTask(appState)
+	err = task.Process(testCtx, sessionID, unembeddedMessages)
 	assert.NoError(t, err)
 
-	embeddedMessages, err := store.GetMessageVectors(
+	embeddedMessages, err := store.GetMessageEmbeddings(
 		testCtx,
 		appState,
-		messageEvent.SessionID,
+		sessionID,
 	)
 	assert.NoError(t, err)
 
 	assert.Equal(t, len(expectedEmbeddingRecords), len(embeddedMessages))
 
-	expectedEmbeddingRecordsMap := make(map[string]models.MessageEmbedding)
+	expectedEmbeddingRecordsMap := make(map[string]models.TextData)
 	for _, r := range expectedEmbeddingRecords {
 		expectedEmbeddingRecordsMap[r.TextUUID.String()] = r
 	}
 
-	embeddedMessagesMap := make(map[string]models.MessageEmbedding)
+	embeddedMessagesMap := make(map[string]models.TextData)
 	for _, r := range embeddedMessages {
 		embeddedMessagesMap[r.TextUUID.String()] = r
 	}

@@ -1,8 +1,8 @@
 llm:
   # openai or anthropic
   service: "openai"
-  # OpenAI: gpt-3.5-turbo, gpt-4, gpt-3.5-turbo-16k, gpt-4-32k; Anthropic: claude-instant-1 or claude-2
-  model: "gpt-3.5-turbo"
+  # OpenAI: gpt-3.5-turbo, gpt-4, gpt-3.5-turbo-1106, gpt-3.5-turbo-16k, gpt-4-32k; Anthropic: claude-instant-1 or claude-2
+  model: "gpt-3.5-turbo-1106"
   ## OpenAI-specific settings
   # Only used for Azure OpenAI API
   azure_openai_endpoint:
@@ -26,9 +26,7 @@ extractors:
   documents:
     embeddings:
       enabled: true
-      max_procs: 2
       chunk_size: 1000
-      buffer_size: 1000
       dimensions: 384
       service: "local"
 #      dimensions: 1536
@@ -36,6 +34,12 @@ extractors:
   messages:
     summarizer:
       enabled: true
+      entities:
+        enabled: true
+      embeddings:
+        enabled: true
+        dimensions: 384
+        service: "local"
     entities:
       enabled: true
     intent:
@@ -58,6 +62,8 @@ server:
   # Warning: The Web UI is not secured by authentication and should not be enabled if
   # Zep is exposed to the public internet.
   web_enabled: true
+  # The maximum size of a request body, in bytes. Defaults to 5MB.
+  max_request_size: 5242880
 auth:
   # Set to true to enable authentication
   required: false
@@ -70,6 +76,10 @@ data:
   purge_every: 60
 log:
   level: "info"
+opentelemetry:
+  enabled: false
+  endpoint:
+  attributes: {}
 # Custom Prompts Configuration
 # Allows customization of extractor prompts.
 custom_prompts:

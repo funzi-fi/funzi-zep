@@ -6,8 +6,10 @@ import (
 	"database/sql"
 	"encoding/binary"
 	"errors"
+	"fmt"
 
 	"github.com/getzep/zep/pkg/store"
+	"github.com/google/uuid"
 
 	"github.com/getzep/zep/internal"
 
@@ -47,10 +49,10 @@ type PostgresMemoryStore struct {
 }
 
 func (pms *PostgresMemoryStore) OnStart(
-	_ context.Context,
+	ctx context.Context,
 	appState *models.AppState,
 ) error {
-	err := CreateSchema(context.Background(), appState, pms.Client)
+	err := CreateSchema(ctx, appState, pms.Client)
 	if err != nil {
 		return store.NewStorageError("failed to ensure postgres schema setup", err)
 	}
@@ -123,7 +125,7 @@ func (pms *PostgresMemoryStore) ListSessionsOrdered(
 //   - the lastNMessages messages, if lastNMessages > 0
 //   - all messages since the last SummaryPoint, if lastNMessages == 0
 //   - if no Summary (and no SummaryPoint) exists and lastNMessages == 0, returns
-//     all undeleted messages
+//     all undeleted messages up to the configured message window
 func (pms *PostgresMemoryStore) GetMemory(
 	ctx context.Context,
 	appState *models.AppState,
@@ -190,12 +192,38 @@ func (pms *PostgresMemoryStore) GetMessageList(
 	return messages, nil
 }
 
+func (pms *PostgresMemoryStore) GetMessagesByUUID(
+	ctx context.Context,
+	_ *models.AppState,
+	sessionID string,
+	uuids []uuid.UUID,
+) ([]models.Message, error) {
+	messages, err := getMessagesByUUID(ctx, pms.Client, sessionID, uuids)
+	if err != nil {
+		return nil, store.NewStorageError("failed to get messages", err)
+	}
+
+	return messages, nil
+}
+
 func (pms *PostgresMemoryStore) GetSummary(
 	ctx context.Context,
 	_ *models.AppState,
 	sessionID string,
 ) (*models.Summary, error) {
 	summary, err := getSummary(ctx, pms.Client, sessionID)
+	if err != nil {
+		return nil, store.NewStorageError("failed to get summary", err)
+	}
+
+	return summary, nil
+}
+
+func (pms *PostgresMemoryStore) GetSummaryByUUID(ctx context.Context,
+	appState *models.AppState,
+	sessionID string,
+	uuid uuid.UUID) (*models.Summary, error) {
+	summary, err := getSummaryByUUID(ctx, appState, pms.Client, sessionID, uuid)
 	if err != nil {
 		return nil, store.NewStorageError("failed to get summary", err)
 	}
@@ -222,6 +250,71 @@ func (pms *PostgresMemoryStore) GetSummaryList(
 	return summaries, nil
 }
 
+func (pms *PostgresMemoryStore) PutSummary(
+	ctx context.Context,
+	appState *models.AppState,
+	sessionID string,
+	summary *models.Summary,
+) error {
+	retSummary, err := putSummary(ctx, pms.Client, sessionID, summary)
+	if err != nil {
+		return store.NewStorageError("failed to Create summary", err)
+	}
+
+	// Publish a message to the message summary embeddings topic
+	task := models.MessageSummaryTask{
+		UUID: retSummary.UUID,
+	}
+	err = appState.TaskPublisher.Publish(
+		models.MessageSummaryEmbedderTopic,
+		map[string]string{
+			"session_id": sessionID,
+		},
+		task,
+	)
+	if err != nil {
+		return fmt.Errorf("MessageSummaryTask publish failed: %w", err)
+	}
+
+	err = appState.TaskPublisher.Publish(
+		models.MessageSummaryNERTopic,
+		map[string]string{
+			"session_id": sessionID,
+		},
+		task,
+	)
+	if err != nil {
+		return fmt.Errorf("MessageSummaryTask publish failed: %w", err)
+	}
+
+	return nil
+}
+
+func (pms *PostgresMemoryStore) UpdateSummaryMetadata(ctx context.Context,
+	_ *models.AppState,
+	summary *models.Summary) error {
+	_, err := updateSummaryMetadata(ctx, pms.Client, summary)
+	if err != nil {
+		return fmt.Errorf("failed to update summary metadata %w", err)
+	}
+
+	return nil
+}
+
+func (pms *PostgresMemoryStore) PutSummaryEmbedding(
+	ctx context.Context,
+	_ *models.AppState,
+	sessionID string,
+	embedding *models.TextData,
+) error {
+	err := putSummaryEmbedding(ctx, pms.Client, sessionID, embedding)
+	if err != nil {
+		return store.NewStorageError("failed to Create summary embedding", err)
+	}
+
+	return nil
+}
+
 func (pms *PostgresMemoryStore) PutMemory(
 	ctx context.Context,
 	appState *models.AppState,
@@ -243,29 +336,23 @@ func (pms *PostgresMemoryStore) PutMemory(
 		return store.NewStorageError("failed to Create messages", err)
 	}
 
+	// If we are skipping pushing new messages to the message router, return early
 	if skipNotify {
 		return nil
 	}
 
-	pms.NotifyExtractors(
-		context.Background(),
-		appState,
-		&models.MessageEvent{SessionID: sessionID,
-			Messages: messageResult},
+	mt := make([]models.MessageTask, len(messageResult))
+	for i, message := range messageResult {
+		mt[i] = models.MessageTask{UUID: message.UUID}
+	}
+
+	// Send new messages to the message router
+	err = appState.TaskPublisher.PublishMessage(
+		map[string]string{"session_id": sessionID},
+		mt,
 	)
-
-	return nil
-}
-
-func (pms *PostgresMemoryStore) PutSummary(
-	ctx context.Context,
-	_ *models.AppState,
-	sessionID string,
-	summary *models.Summary,
-) error {
-	_, err := putSummary(ctx, pms.Client, sessionID, summary)
 	if err != nil {
-		return store.NewStorageError("failed to Create summary", err)
+		return store.NewStorageError("failed to publish new messages", err)
 	}
 
 	return nil
@@ -292,7 +379,7 @@ func (pms *PostgresMemoryStore) SearchMemory(
 	query *models.MemorySearchPayload,
 	limit int,
 ) ([]models.MemorySearchResult, error) {
-	searchResults, err := searchMessages(ctx, appState, pms.Client, sessionID, query, limit)
+	searchResults, err := searchMemory(ctx, appState, pms.Client, sessionID, query, limit)
 	return searchResults, err
 }
 
@@ -303,10 +390,10 @@ func (pms *PostgresMemoryStore) Close() error {
 	return nil
 }
 
-func (pms *PostgresMemoryStore) PutMessageVectors(ctx context.Context,
+func (pms *PostgresMemoryStore) PutMessageEmbeddings(ctx context.Context,
 	_ *models.AppState,
 	sessionID string,
-	embeddings []models.MessageEmbedding,
+	embeddings []models.TextData,
 ) error {
 	if embeddings == nil {
 		return store.NewStorageError("nil embeddings received", nil)
@@ -323,13 +410,13 @@ func (pms *PostgresMemoryStore) PutMessageVectors(ctx context.Context,
 	return nil
 }
 
-func (pms *PostgresMemoryStore) GetMessageVectors(ctx context.Context,
+func (pms *PostgresMemoryStore) GetMessageEmbeddings(ctx context.Context,
 	_ *models.AppState,
 	sessionID string,
-) ([]models.MessageEmbedding, error) {
+) ([]models.TextData, error) {
 	embeddings, err := getMessageEmbeddings(ctx, pms.Client, sessionID)
 	if err != nil {
-		return nil, store.NewStorageError("GetMessageVectors failed to get embeddings", err)
+		return nil, store.NewStorageError("GetMessageEmbeddings failed to get embeddings", err)
 	}
 
 	return embeddings, nil

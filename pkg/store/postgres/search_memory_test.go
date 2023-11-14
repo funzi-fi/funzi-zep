@@ -7,8 +7,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/getzep/zep/pkg/extractors"
-
 	"github.com/uptrace/bun"
 
 	"github.com/getzep/zep/pkg/models"
@@ -22,56 +20,113 @@ func TestMemorySearch(t *testing.T) {
 	assert.NoError(t, err, "GenerateRandomSessionID should not return an error")
 
 	// Call putMessages function
-	msgs, err := putMessages(testCtx, testDB, sessionID, testutils.TestMessages)
-	assert.NoError(t, err, "putMessages should not return an error")
+	err = appState.MemoryStore.PutMemory(testCtx, appState, sessionID,
+		&models.Memory{
+			Messages: testutils.TestMessages,
+		}, false,
+	)
+	assert.NoError(t, err, "PutMemory should not return an error")
 
-	e := extractors.NewEmbeddingExtractor()
-	err = e.Extract(testCtx, appState, &models.MessageEvent{SessionID: sessionID, Messages: msgs})
-	assert.NoError(t, err, "EmbeddingExtractor.Extract should not return an error")
+	timeout := time.After(10 * time.Second)
+	tick := time.Tick(500 * time.Millisecond)
+	for {
+		select {
+		case <-timeout:
+			t.Fatal("timed out waiting for messages to be indexed")
+		case <-tick:
+			me, err := getMessageEmbeddings(testCtx, testDB, sessionID)
+			assert.NoError(t, err, "getMessageEmbeddings should not return an error")
+			se, err := getSummaryEmbeddings(testCtx, testDB, sessionID)
+			assert.NoError(t, err, "getSummaryEmbeddings should not return an error")
+			if len(me) != 0 && len(se) != 0 {
+				goto DONE
+			}
+		}
+	}
 
-	// enrichment runs async. Wait for it to finish
-	// This is hacky but I'd prefer not to add a WaitGroup to the putMessages function just for testing purposes
-	time.Sleep(time.Second * 2)
-
+DONE:
 	// Test cases
 	testCases := []struct {
 		name              string
 		query             string
 		limit             int
 		expectedErrorText string
+		SearchScope       models.SearchScope
+		searchType        models.SearchType
 	}{
-		{"Empty Query", "", 0, "empty query"},
-		{"Non-empty Query", "travel", 0, ""},
-		{"Limit 0", "travel", 0, ""},
-		{"Limit 5", "travel", 5, ""},
+		{"Empty Query", "", 0, "empty query",
+			models.SearchScopeMessages, models.SearchTypeSimilarity},
+		{
+			"Non-empty Query",
+			"travel",
+			0,
+			"",
+			models.SearchScopeMessages,
+			models.SearchTypeSimilarity,
+		},
+		{"Limit 0", "travel", 0, "", models.SearchScopeMessages, models.SearchTypeSimilarity},
+		{"Limit 5", "travel", 5, "", models.SearchScopeMessages, models.SearchTypeSimilarity},
+		{"Limit 5 Empty SearchScope", "travel", 5, "", "", models.SearchTypeSimilarity},
+		{"MMR Query", "travel", 5, "", models.SearchScopeMessages, models.SearchTypeMMR},
+		{
+			"SearchScope Summary",
+			"travel",
+			1,
+			"",
+			models.SearchScopeSummary,
+			models.SearchTypeSimilarity,
+		},
+		{
+			"SearchScope Summary MMR",
+			"travel",
+			1,
+			"",
+			models.SearchScopeSummary,
+			models.SearchTypeMMR,
+		},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			q := models.MemorySearchPayload{Text: tc.query}
+			q := models.MemorySearchPayload{
+				Text:        tc.query,
+				SearchType:  tc.searchType,
+				SearchScope: tc.SearchScope,
+			}
 			expectedLastN := tc.limit
 			if expectedLastN == 0 {
 				expectedLastN = 10 // Default value
 			}
 
-			s, err := searchMessages(testCtx, appState, testDB, sessionID, &q, expectedLastN)
+			s, err := searchMemory(testCtx, appState, testDB, sessionID, &q, expectedLastN)
 
 			if tc.expectedErrorText != "" {
 				assert.ErrorContains(
 					t,
 					err,
 					tc.expectedErrorText,
-					"searchMessages should return the expected error",
+					"searchMemory should return the expected error",
 				)
 			} else {
-				assert.NoError(t, err, "searchMessages should not return an error")
+				assert.NoError(t, err, "searchMemory should not return an error")
 				assert.Len(t, s, expectedLastN, fmt.Sprintf("Expected %d messages to be returned", expectedLastN))
 
-				for _, res := range s {
-					assert.NotNil(t, res.Message.UUID, "message__uuid should be present")
-					assert.NotNil(t, res.Message.CreatedAt, "message__created_at should be present")
-					assert.NotNil(t, res.Message.Role, "message__role should be present")
-					assert.NotNil(t, res.Message.Content, "message__content should be present")
+				if tc.SearchScope == models.SearchScopeSummary {
+					for _, res := range s {
+						assert.NotNil(t, res.Summary, "summary should be present")
+						assert.NotNil(t, res.Summary.UUID, "summary__uuid should be present")
+						assert.NotNil(t, res.Summary.CreatedAt, "summary__created_at should be present")
+						assert.NotNil(t, res.Summary.Content, "summary__content should be present")
+						assert.NotNil(t, res.Dist, "dist should be present")
+					}
+				} else {
+					for _, res := range s {
+						assert.NotNil(t, res.Message.UUID, "message__uuid should be present")
+						assert.NotNil(t, res.Message.CreatedAt, "message__created_at should be present")
+						assert.NotNil(t, res.Message.Role, "message__role should be present")
+						assert.NotNil(t, res.Message.Content, "message__content should be present")
+						assert.NotNil(t, res.Dist, "dist should be present")
+					}
 				}
 			}
 		})
@@ -111,7 +166,7 @@ func TestAddDateFilters(t *testing.T) {
 			err := json.Unmarshal([]byte(tt.inputDates), &inputDates)
 			assert.NoError(t, err)
 
-			addMessageDateFilters(&qb, inputDates)
+			addMessageDateFilters(&qb, inputDates, "m")
 
 			selectQuery := qb.Unwrap().(*bun.SelectQuery)
 

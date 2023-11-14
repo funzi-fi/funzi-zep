@@ -9,8 +9,6 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/hashicorp/go-retryablehttp"
-
 	"github.com/getzep/zep/pkg/models"
 )
 
@@ -28,17 +26,25 @@ func embedTextsLocal(
 		return nil, nil
 	}
 
-	if documentType != "message" && documentType != "document" {
+	var endpoint string
+	switch documentType {
+	case "message":
+		endpoint = "/embeddings/message"
+	case "summary":
+		endpoint = "/embeddings/message"
+	case "document":
+		endpoint = "/embeddings/document"
+	default:
 		return nil, fmt.Errorf("invalid document type: %s", documentType)
 	}
 
-	url := appState.Config.NLP.ServerURL + "/embeddings/" + documentType
+	url := appState.Config.NLP.ServerURL + endpoint
 
-	documents := make([]models.MessageEmbedding, len(texts))
+	documents := make([]models.TextData, len(texts))
 	for i, text := range texts {
-		documents[i] = models.MessageEmbedding{Text: text}
+		documents[i] = models.TextData{Text: text}
 	}
-	collection := models.MessageEmbeddingCollection{
+	collection := models.TextEmbeddingCollection{
 		Embeddings: documents,
 	}
 	jsonBody, err := json.Marshal(collection)
@@ -76,12 +82,12 @@ func makeEmbedRequest(ctx context.Context, url string, jsonBody []byte) ([]byte,
 	ctx, cancel := context.WithTimeout(ctx, LocalEmbedderTimeout)
 	defer cancel()
 
-	retryableHTTPClient := NewRetryableHTTPClient(
+	httpClient := NewRetryableHTTPClient(
 		MaxLocalEmbedderRetryAttempts,
 		LocalEmbedderTimeout,
 	)
 
-	req, err := retryablehttp.NewRequestWithContext(
+	req, err := http.NewRequestWithContext(
 		ctx,
 		http.MethodPost,
 		url,
@@ -92,7 +98,7 @@ func makeEmbedRequest(ctx context.Context, url string, jsonBody []byte) ([]byte,
 	}
 
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := retryableHTTPClient.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		log.Error("Error making POST request:", err)
 		return nil, err

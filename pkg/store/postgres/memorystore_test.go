@@ -8,8 +8,7 @@ import (
 	"time"
 
 	"github.com/getzep/zep/pkg/llms"
-
-	"github.com/getzep/zep/pkg/extractors"
+	"github.com/getzep/zep/pkg/tasks"
 
 	"github.com/getzep/zep/internal"
 	"github.com/sirupsen/logrus"
@@ -61,17 +60,23 @@ func setup() {
 	// Initialize the test context
 	testCtx = context.Background()
 
+	err = CreateSchema(testCtx, appState, testDB)
+	if err != nil {
+		panic(err)
+	}
+
 	memoryStore, err := NewPostgresMemoryStore(appState, testDB)
 	if err != nil {
 		panic(err)
 	}
 	appState.MemoryStore = memoryStore
-	extractors.Initialize(appState)
 
-	err = CreateSchema(testCtx, appState, testDB)
+	// Set up the task router
+	db, err := NewPostgresConnForQueue(appState)
 	if err != nil {
 		panic(err)
 	}
+	tasks.RunTaskRouter(testCtx, appState, db)
 
 	embeddingModel = &models.EmbeddingModel{
 		Service:    "local",
@@ -106,7 +111,7 @@ func TestPutMessages(t *testing.T) {
 		resultMessages, err := putMessages(testCtx, testDB, sessionID, messages)
 		assert.NoError(t, err, "putMessages should not return an error")
 
-		verifyMessagesInDB(t, messages, resultMessages)
+		verifyMessagesInDB(t, messages, resultMessages, false)
 	})
 
 	t.Run("upsert messages with updated TokenCount", func(t *testing.T) {
@@ -123,7 +128,7 @@ func TestPutMessages(t *testing.T) {
 		upsertedMessages, err := putMessages(testCtx, testDB, sessionID, insertedMessages)
 		assert.NoError(t, err, "putMessages should not return an error")
 
-		verifyMessagesInDB(t, insertedMessages, upsertedMessages)
+		verifyMessagesInDB(t, insertedMessages, upsertedMessages, true)
 	})
 
 	t.Run(
@@ -169,6 +174,7 @@ func verifyMessagesInDB(
 	t *testing.T,
 	expectedMessages,
 	resultMessages []models.Message,
+	verifyUpdatedAt bool,
 ) {
 	assert.Equal(
 		t,
@@ -209,12 +215,14 @@ func verifyMessagesInDB(
 			resultMessages[i].Metadata,
 			"Expected Metadata to be equal",
 		)
-		assert.Less(
-			t,
-			resultMessages[i].CreatedAt,
-			resultMessages[i].UpdatedAt,
-			"CreatedAt should be less than UpdatedAt",
-		)
+		if verifyUpdatedAt {
+			assert.Less(
+				t,
+				resultMessages[i].CreatedAt,
+				resultMessages[i].UpdatedAt,
+				"CreatedAt should be less than UpdatedAt",
+			)
+		}
 	}
 }
 
@@ -242,10 +250,10 @@ func TestGetMessages(t *testing.T) {
 		withSummary    bool
 	}{
 		{
-			name:           "Get all messages",
+			name:           "Get all messages within messageWindow",
 			sessionID:      sessionID,
 			lastNMessages:  0,
-			expectedLength: len(messages),
+			expectedLength: messageWindow,
 			withSummary:    false,
 		},
 		{
@@ -413,7 +421,7 @@ func TestPutEmbeddingsLocal(t *testing.T) {
 	err := CreateSchema(testCtx, appState, testDB)
 	assert.NoError(t, err)
 
-	err = MigrateMessageEmbeddingDims(testCtx, testDB, embeddingModel.Dimensions)
+	err = MigrateEmbeddingDims(testCtx, testDB, "message_embedding", embeddingModel.Dimensions)
 	assert.NoError(t, err)
 
 	sessionID, err := testutils.GenerateRandomSessionID(16)
@@ -439,7 +447,7 @@ func TestPutEmbeddingsLocal(t *testing.T) {
 	}
 
 	// Create embeddings
-	embeddings := []models.MessageEmbedding{
+	embeddings := []models.TextData{
 		{
 			TextUUID:  resultMessages[0].UUID,
 			Text:      resultMessages[0].Content,

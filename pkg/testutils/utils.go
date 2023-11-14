@@ -26,7 +26,7 @@ func testConfigDefaults() (*config.Config, error) {
 	testConfig := &config.Config{
 		LLM: config.LLM{
 			Service: "openai",
-			Model:   "gpt-3.5-turbo",
+			Model:   "gpt-3.5-turbo-1106",
 		},
 		NLP: config.NLP{
 			ServerURL: "http://localhost:5557",
@@ -45,6 +45,11 @@ func testConfigDefaults() (*config.Config, error) {
 			Messages: config.MessageExtractorsConfig{
 				Summarizer: config.SummarizerConfig{
 					Enabled: true,
+					Embeddings: config.EmbeddingsConfig{
+						Enabled:    true,
+						Dimensions: 1536,
+						Service:    "openai",
+					},
 				},
 				Embeddings: config.EmbeddingsConfig{
 					Enabled:    true,
@@ -60,9 +65,10 @@ func testConfigDefaults() (*config.Config, error) {
 			},
 		},
 		Server: config.ServerConfig{
-			Host:       "0.0.0.0",
-			Port:       8000,
-			WebEnabled: true,
+			Host:           "0.0.0.0",
+			Port:           8000,
+			WebEnabled:     true,
+			MaxRequestSize: 1 << 20, // 10MB
 		},
 		Auth: config.AuthConfig{
 			Secret:   "do-not-use-this-secret-in-production",

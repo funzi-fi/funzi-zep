@@ -1,6 +1,7 @@
 package postgres
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/getzep/zep/pkg/models"
@@ -78,8 +79,8 @@ func TestPutSummary(t *testing.T) {
 
 			if tt.wantErr {
 				assert.Error(t, err)
-				storageErr, ok := err.(*store.StorageError)
-				if ok {
+				var storageErr *store.StorageError
+				if ok := errors.As(err, &storageErr); ok {
 					assert.Equal(t, tt.errMessage, storageErr.Message)
 				}
 			} else {
@@ -185,6 +186,138 @@ func TestGetSummary(t *testing.T) {
 	}
 }
 
+func TestPostgresMemoryStore_GetSummaryByUUID(t *testing.T) {
+	sessionID := createSession(t)
+
+	messages := []models.Message{
+		{
+			Role:     "user",
+			Content:  "Hello",
+			Metadata: map[string]interface{}{"timestamp": "1629462540"},
+		},
+		{
+			Role:     "bot",
+			Content:  "Hi there!",
+			Metadata: map[string]interface{}{"timestamp": 1629462551},
+		},
+	}
+
+	// Call putMessages function
+	resultMessages, err := putMessages(testCtx, testDB, sessionID, messages)
+	assert.NoError(t, err, "putMessages should not return an error")
+
+	summary := models.Summary{
+		Content: "Test content",
+		Metadata: map[string]interface{}{
+			"key": "value",
+		},
+		SummaryPointUUID: resultMessages[0].UUID,
+	}
+
+	// Call putSummary function
+	resultSummary, err := putSummary(testCtx, testDB, sessionID, &summary)
+	assert.NoError(t, err, "putSummary should not return an error")
+
+	tests := []struct {
+		name          string
+		sessionID     string
+		uuid          uuid.UUID
+		expectedFound bool
+	}{
+		{
+			name:          "Existing summary",
+			sessionID:     sessionID,
+			uuid:          resultSummary.UUID,
+			expectedFound: true,
+		},
+		{
+			name:          "Non-existent summary",
+			sessionID:     sessionID,
+			uuid:          uuid.New(),
+			expectedFound: false,
+		},
+		{
+			name:          "Non-existent session",
+			sessionID:     "nonexistent",
+			uuid:          uuid.New(),
+			expectedFound: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := getSummaryByUUID(
+				testCtx,
+				appState,
+				testDB,
+				tt.sessionID,
+				tt.uuid,
+			)
+
+			if tt.expectedFound {
+				assert.NoError(t, err)
+				assert.NotNil(t, result)
+				assert.Equal(t, resultSummary.UUID, result.UUID)
+				assert.False(t, result.CreatedAt.IsZero())
+				assert.Equal(t, resultSummary.Content, result.Content)
+				assert.Equal(t, resultSummary.Metadata, result.Metadata)
+			} else {
+				assert.Nil(t, result)
+				assert.ErrorIs(t, err, models.ErrNotFound)
+			}
+		})
+	}
+}
+
+func TestPostgresMemoryStore_PutSummaryEmbedding(t *testing.T) {
+	sessionID := createSession(t)
+
+	messages := []models.Message{
+		{
+			Role:     "user",
+			Content:  "Hello",
+			Metadata: map[string]interface{}{"timestamp": "1629462540"},
+		},
+		{
+			Role:     "bot",
+			Content:  "Hi there!",
+			Metadata: map[string]interface{}{"timestamp": 1629462551},
+		},
+	}
+
+	// Call putMessages function
+	resultMessages, err := putMessages(testCtx, testDB, sessionID, messages)
+	assert.NoError(t, err, "putMessages should not return an error")
+
+	summary := models.Summary{
+		Content: "Test content",
+		Metadata: map[string]interface{}{
+			"key": "value",
+		},
+		SummaryPointUUID: resultMessages[0].UUID,
+	}
+
+	// Call putSummary function
+	resultSummary, err := putSummary(testCtx, testDB, sessionID, &summary)
+	assert.NoError(t, err, "putSummary should not return an error")
+
+	v := make([]float32, appState.Config.Extractors.Messages.Summarizer.Embeddings.Dimensions)
+
+	embedding := models.TextData{
+		Embedding: v,
+		TextUUID:  resultSummary.UUID,
+		Text:      resultSummary.Content,
+	}
+
+	err = putSummaryEmbedding(
+		testCtx,
+		testDB,
+		sessionID,
+		&embedding,
+	)
+	assert.NoError(t, err, "putSummaryEmbedding should not return an error")
+}
+
 func TestGetSummaryList(t *testing.T) {
 	// Create a test session
 	sessionID, err := testutils.GenerateRandomSessionID(16)
@@ -253,4 +386,48 @@ func TestGetSummaryList(t *testing.T) {
 			assert.Equal(t, tt.expectedCount, len(summaries.Summaries))
 		})
 	}
+}
+
+func TestUpdateSummaryMetadata(t *testing.T) {
+	// Step 1: Create a session
+	sessionID := createSession(t)
+
+	// Step 2: Put test messages
+	messages := []models.Message{
+		{
+			Role:    "user",
+			Content: "Hello",
+		},
+		{
+			Role:    "bot",
+			Content: "Hi there!",
+		},
+	}
+	returnedMessages, err := putMessages(testCtx, testDB, sessionID, messages)
+	assert.NoError(t, err, "putMessages should not return an error")
+
+	// Step 3: Use putSummary to add a new test summary
+	summary := models.Summary{
+		SummaryPointUUID: returnedMessages[0].UUID,
+		Metadata: map[string]interface{}{
+			"key1": "value1",
+			"key2": "value2",
+		},
+	}
+	returnedSummary, err := putSummary(testCtx, testDB, sessionID, &summary)
+	assert.NoError(t, err, "putSummary should not return an error")
+
+	// Step 4: UpdateSummaryMetadata to update the metadata
+	newMetadata := map[string]interface{}{
+		"key1": "new value1",
+		"key2": "new value2",
+	}
+	returnedSummary.Metadata = newMetadata
+	_, err = updateSummaryMetadata(testCtx, testDB, returnedSummary)
+	assert.NoError(t, err, "updateSummaryMetadata should not return an error")
+
+	// Step 5: GetSummary to test that the metadata was correctly updated
+	resultSummary, err := getSummary(testCtx, testDB, sessionID)
+	assert.NoError(t, err, "getSummary should not return an error")
+	assert.Equal(t, newMetadata, resultSummary.Metadata)
 }

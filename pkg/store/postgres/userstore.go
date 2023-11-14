@@ -29,6 +29,9 @@ func (dao *UserStoreDAO) Create(
 	ctx context.Context,
 	user *models.CreateUserRequest,
 ) (*models.User, error) {
+	if user.UserID == "" {
+		return nil, models.NewBadRequestError("UserID cannot be empty")
+	}
 	userDB := &UserSchema{
 		UserID:    user.UserID,
 		Email:     user.Email,
@@ -170,6 +173,28 @@ func (dao *UserStoreDAO) updateUser(
 
 // Delete deletes a user.
 func (dao *UserStoreDAO) Delete(ctx context.Context, userID string) error {
+	// Start a new transaction
+	tx, err := dao.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer rollbackOnError(tx)
+
+	// Delete all related sessions
+	sessions, err := dao.GetSessions(ctx, userID)
+	if err != nil {
+		return err
+	}
+
+	sessionStore := NewSessionDAO(dao.db)
+	for s := range sessions {
+		err := sessionStore.Delete(ctx, sessions[s].SessionID)
+		if err != nil {
+			return err
+		}
+	}
+
+	// Delete User
 	r, err := dao.db.NewDelete().Model(&models.User{}).Where("user_id = ?", userID).Exec(ctx)
 	if err != nil {
 		return err
@@ -180,6 +205,12 @@ func (dao *UserStoreDAO) Delete(ctx context.Context, userID string) error {
 	}
 	if rowsAffected == 0 {
 		return models.NewNotFoundError("user " + userID)
+	}
+
+	// Commit the transaction
+	err = tx.Commit()
+	if err != nil {
+		return err
 	}
 
 	return nil
